@@ -138,24 +138,26 @@ class Vault
 
   # Create a new vault.
   # sq_data: [{question: String, answer: String}, ...]
+  # Each question gets its own recovery blob so any single answer can reset the password.
   def create!(username:, password:, sq_data:)
     vkey        = OpenSSL::Random.random_bytes(KEY_BYTES)
     master_salt = OpenSSL::Random.random_bytes(SALT_BYTES)
     master_key  = Crypto.derive_key(password, master_salt)
     master_blob = Crypto.encrypt_raw(vkey, master_key)
 
-    rec_salt   = OpenSSL::Random.random_bytes(SALT_BYTES)
-    ans_concat = sq_data.map { |q| q[:answer].strip.downcase }.join('|')
-    rec_key    = Crypto.derive_key(ans_concat, rec_salt)
-    rec_blob   = Crypto.encrypt_raw(vkey, rec_key)
-
     questions = sq_data.map do |q|
+      ans_norm = q[:answer].strip.downcase
       ans_salt = OpenSSL::Random.random_bytes(SALT_BYTES)
-      ans_hash = Crypto.derive_key(q[:answer].strip.downcase, ans_salt)
+      ans_hash = Crypto.derive_key(ans_norm, ans_salt)
+      rec_salt = OpenSSL::Random.random_bytes(SALT_BYTES)
+      rec_key  = Crypto.derive_key(ans_norm, rec_salt)
+      rec_blob = Crypto.encrypt_raw(vkey, rec_key)
       {
-        'question'    => q[:question],
-        'answer_hash' => Base64.strict_encode64(ans_hash),
-        'answer_salt' => Base64.strict_encode64(ans_salt)
+        'question'      => q[:question],
+        'answer_hash'   => Base64.strict_encode64(ans_hash),
+        'answer_salt'   => Base64.strict_encode64(ans_salt),
+        'recovery_salt' => Base64.strict_encode64(rec_salt),
+        'recovery_blob' => rec_blob
       }
     end
 
@@ -163,8 +165,6 @@ class Vault
       'username'           => username,
       'master_salt'        => Base64.strict_encode64(master_salt),
       'master_blob'        => master_blob,
-      'recovery_salt'      => Base64.strict_encode64(rec_salt),
-      'recovery_blob'      => rec_blob,
       'security_questions' => questions
     }
     File.write(META_FILE, JSON.generate(meta), encoding: 'UTF-8')
@@ -204,33 +204,33 @@ class Vault
     []
   end
 
-  # Returns true if every answer matches its stored hash.
-  def verify_answers(answers)
+  # Verify a single answer by question index.
+  def verify_single_answer(index, answer)
     return false unless File.exist?(META_FILE)
-    sq = load_meta['security_questions']
-    return false unless sq.length == answers.length
-    sq.each_with_index.all? do |q, i|
-      ans_salt = Base64.strict_decode64(q['answer_salt'])
-      expected = Base64.strict_decode64(q['answer_hash'])
-      actual   = Crypto.derive_key(answers[i].strip.downcase, ans_salt)
-      Crypto.secure_compare(expected, actual)
-    end
+    sq = load_meta['security_questions'][index]
+    return false unless sq
+    ans_salt = Base64.strict_decode64(sq['answer_salt'])
+    expected = Base64.strict_decode64(sq['answer_hash'])
+    actual   = Crypto.derive_key(answer.strip.downcase, ans_salt)
+    Crypto.secure_compare(expected, actual)
   rescue StandardError
     false
   end
 
-  # Decrypt recovery_blob with answers, re-wrap vkey under new master password.
-  def reset_password!(answers, new_password)
+  # Decrypt the recovery blob for the given question index and re-wrap the
+  # vault key under a new master password.
+  def reset_with_answer(index, answer, new_password)
     return false unless File.exist?(META_FILE)
-    meta      = load_meta
-    rec_salt  = Base64.strict_decode64(meta['recovery_salt'])
-    ac        = answers.map { |a| a.strip.downcase }.join('|')
-    rec_key   = Crypto.derive_key(ac, rec_salt)
-    vkey      = Crypto.decrypt_raw(meta['recovery_blob'], rec_key)
+    meta     = load_meta
+    sq       = meta['security_questions'][index]
+    return false unless sq
+    rec_salt = Base64.strict_decode64(sq['recovery_salt'])
+    rec_key  = Crypto.derive_key(answer.strip.downcase, rec_salt)
+    vkey     = Crypto.decrypt_raw(sq['recovery_blob'], rec_key)
 
-    new_salt  = OpenSSL::Random.random_bytes(SALT_BYTES)
-    new_key   = Crypto.derive_key(new_password, new_salt)
-    new_blob  = Crypto.encrypt_raw(vkey, new_key)
+    new_salt = OpenSSL::Random.random_bytes(SALT_BYTES)
+    new_key  = Crypto.derive_key(new_password, new_salt)
+    new_blob = Crypto.encrypt_raw(vkey, new_key)
 
     meta['master_salt'] = Base64.strict_encode64(new_salt)
     meta['master_blob'] = new_blob
@@ -677,8 +677,7 @@ end
 
 # =============================================================================
 # Forgot Password Dialog
-# Phase 1: answer security questions  →  Phase 2: set new password
-# All in one dialog, no nested d.run calls.
+# Phase 1: pick one security question + answer  →  Phase 2: set new password
 # Returns true if password was successfully reset.
 # =============================================================================
 def open_forgot_dialog(vault)
@@ -698,31 +697,36 @@ def open_forgot_dialog(vault)
   area.margin = 20
   area.spacing = 8
 
-  # ── Phase 1: Security Questions ───────────────────────────────────────────
+  # ── Phase 1: Pick question + answer ──────────────────────────────────────
   phase1 = Gtk::Box.new(:vertical, 8)
 
   p1_title = Gtk::Label.new
-  p1_title.markup = '<b><big>Answer Security Questions</big></b>'
+  p1_title.markup = '<b><big>Reset Master Password</big></b>'
   p1_title.xalign = 0
+  p1_sub = Gtk::Label.new
+  p1_sub.markup = '<small>Select one of your security questions and enter the answer.</small>'
+  p1_sub.xalign = 0
+  p1_sub.wrap   = true
   phase1.pack_start(p1_title, expand: false, fill: false, padding: 0)
+  phase1.pack_start(p1_sub,   expand: false, fill: false, padding: 0)
+  phase1.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
 
-  ans_entries = questions.map do |q|
-    lbl = Gtk::Label.new(q)
-    lbl.xalign = 0
-    lbl.wrap   = true
-    e = Gtk::Entry.new
-    e.placeholder_text = 'Your answer'
-    e.hexpand          = true
-    phase1.pack_start(lbl, expand: false, fill: false, padding: 0)
-    phase1.pack_start(e,   expand: false, fill: false, padding: 0)
-    e
-  end
+  q_cb = Gtk::ComboBoxText.new
+  questions.each { |q| q_cb.append_text(q) }
+  q_cb.active  = 0
+  q_cb.hexpand = true
+  phase1.pack_start(q_cb, expand: false, fill: false, padding: 0)
+
+  ans_e = Gtk::Entry.new
+  ans_e.placeholder_text = 'Your answer'
+  ans_e.hexpand          = true
+  phase1.pack_start(ans_e, expand: false, fill: false, padding: 0)
 
   err1 = Gtk::Label.new
   err1.xalign = 0
   phase1.pack_start(err1, expand: false, fill: false, padding: 0)
 
-  verify_btn = Gtk::Button.new(label: 'Verify Answers →')
+  verify_btn = Gtk::Button.new(label: 'Verify Answer →')
   verify_btn.style_context.add_class('suggested-action')
   phase1.pack_start(verify_btn, expand: false, fill: false, padding: 0)
 
@@ -772,16 +776,17 @@ def open_forgot_dialog(vault)
   d.show_all
   phase2.hide
 
-  verified_answers = nil
+  verified_index  = nil
+  verified_answer = nil
 
-  # Verify button fires inside d.run but does NOT open a nested dialog —
-  # it just hides/shows widgets and enables the Reset button.
   verify_btn.signal_connect('clicked') do
-    answers = ans_entries.map(&:text)
-    if answers.any?(&:empty?)
-      err1.markup = "<span foreground='red'>⚠ Please answer all questions</span>"
-    elsif vault.verify_answers(answers)
-      verified_answers = answers
+    idx = q_cb.active
+    ans = ans_e.text
+    if ans.strip.empty?
+      err1.markup = "<span foreground='red'>⚠ Please enter your answer</span>"
+    elsif vault.verify_single_answer(idx, ans)
+      verified_index  = idx
+      verified_answer = ans
       pos = d.position
       phase1.hide
       phase2.show
@@ -790,7 +795,7 @@ def open_forgot_dialog(vault)
       reset_btn.sensitive = true
       new_pass_e.grab_focus
     else
-      err1.markup = "<span foreground='red'>⚠ One or more answers are incorrect</span>"
+      err1.markup = "<span foreground='red'>⚠ Incorrect answer – please try again</span>"
     end
   end
 
@@ -814,7 +819,7 @@ def open_forgot_dialog(vault)
       err2.markup = "<span foreground='red'>⚠ Passwords do not match</span>"
       next
     end
-    if vault.reset_password!(verified_answers, np)
+    if vault.reset_with_answer(verified_index, verified_answer, np)
       result = true
       break
     else
