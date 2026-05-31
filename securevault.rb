@@ -28,6 +28,19 @@ REMEMBER_FILE     = File.join(VAULT_DIR, 'remember')
 THEME_FILE        = File.join(VAULT_DIR, 'theme')
 APP_TITLE         = 'SecureVault'
 
+MAX_LOGIN_ATTEMPTS = 5      # failed logins before each lockout
+LOCKOUT_DURATIONS  = [      # escalating lockout durations in seconds
+  60,        # 1st lockout  → 1 minute
+  300,       # 2nd          → 5 minutes
+  900,       # 3rd          → 15 minutes
+  3_600,     # 4th          → 1 hour
+  86_400,    # 5th          → 1 day
+  604_800    # 6th+         → 1 week (max)
+].freeze
+LOCKOUT_FILE       = File.join(File.join(Dir.home, '.securevault'), 'lockout')
+INACTIVITY_MINUTES = 5      # minutes of idle before auto-lock
+CLIPBOARD_CLEAR_SECS = 30   # seconds before clipboard is wiped
+
 # Fixed set of security questions (user answers first 3)
 SECURITY_QUESTION_POOL = [
   'What was the name of your first pet?',
@@ -339,13 +352,62 @@ def esc(str)
   str.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;').gsub('"', '&quot;')
 end
 
+$sv_clip_source = nil
+
 def clipboard_write(text)
-  Gtk::Clipboard.get(Gdk::Selection::CLIPBOARD).text = text.to_s
+  cb = Gtk::Clipboard.get(Gdk::Selection::CLIPBOARD)
+  cb.text = text.to_s
+  GLib::Source.remove($sv_clip_source) if $sv_clip_source
+  $sv_clip_source = GLib::Timeout.add(CLIPBOARD_CLEAR_SECS * 1000) do
+    cb.clear
+    $sv_clip_source = nil
+    false
+  end
 end
 
 def status_flash(statusbar, ctx_id, msg, seconds: 4)
   statusbar.push(ctx_id, msg)
   GLib::Timeout.add(seconds * 1000) { statusbar.pop(ctx_id); false }
+end
+
+def format_duration(secs)
+  case secs
+  when 60      then '1 minute'
+  when 300     then '5 minutes'
+  when 900     then '15 minutes'
+  when 3_600   then '1 hour'
+  when 86_400  then '1 day'
+  when 604_800 then '1 week'
+  else              "#{secs} seconds"
+  end
+end
+
+def format_remaining(secs)
+  if    secs <= 60     then "#{secs} second#{secs == 1 ? '' : 's'}"
+  elsif secs <= 3_600  then m = (secs / 60.0).ceil;  "#{m} minute#{m == 1 ? '' : 's'}"
+  elsif secs <= 86_400 then h = (secs / 3_600.0).ceil; "#{h} hour#{h == 1 ? '' : 's'}"
+  else                      d = (secs / 86_400.0).ceil; "#{d} day#{d == 1 ? '' : 's'}"
+  end
+end
+
+def save_lockout_state(count, until_time)
+  FileUtils.mkdir_p(File.dirname(LOCKOUT_FILE))
+  data = { 'count' => count, 'until' => until_time&.iso8601 }
+  File.write(LOCKOUT_FILE, JSON.generate(data), encoding: 'UTF-8')
+rescue StandardError
+end
+
+def load_lockout_state
+  data = JSON.parse(File.read(LOCKOUT_FILE, encoding: 'UTF-8'))
+  until_time = data['until'] ? Time.parse(data['until']) : nil
+  [data['count'].to_i, until_time]
+rescue StandardError
+  [0, nil]
+end
+
+def clear_lockout_state
+  File.delete(LOCKOUT_FILE) if File.exist?(LOCKOUT_FILE)
+rescue StandardError
 end
 
 def load_theme_preference
@@ -453,6 +515,8 @@ def open_setup_dialog
   confirm_e.placeholder_text = 'Confirm password'
   confirm_e.hexpand          = true
   phase1.pack_start(mk_row.call('Confirm:', confirm_e), expand: false, fill: false, padding: 0)
+
+  build_strength_indicator(phase1, pass_e)
 
   err1 = Gtk::Label.new
   err1.xalign = 0
@@ -768,6 +832,8 @@ def open_forgot_dialog(vault)
   new_pass_e.hexpand          = true
   phase2.pack_start(mk_row.call('Password:', new_pass_e), expand: false, fill: false, padding: 0)
 
+  build_strength_indicator(phase2, new_pass_e)
+
   new_confirm_e = Gtk::Entry.new
   new_confirm_e.visibility       = false
   new_confirm_e.placeholder_text = 'Confirm new password'
@@ -843,6 +909,62 @@ def open_forgot_dialog(vault)
   result
 end
 
+# Adds a live password strength indicator to +container+ tracking +pass_e+.
+# Initializes immediately so GTK allocates layout space before the user types.
+# Returns the update lambda so callers can retrigger it (e.g. after Generate).
+def build_strength_indicator(container, pass_e)
+  s_lbl = Gtk::Label.new
+  s_lbl.xalign = 0
+  r_lbl = Gtk::Label.new
+  r_lbl.xalign = 0
+  r_lbl.wrap   = true
+
+  box = Gtk::Box.new(:vertical, 2)
+  box.pack_start(s_lbl, expand: false, fill: false, padding: 0)
+  box.pack_start(r_lbl, expand: false, fill: false, padding: 0)
+  container.pack_start(box, expand: false, fill: false, padding: 0)
+
+  update = lambda do
+    pw   = pass_e.text
+    reqs = {
+      length: pw.length >= 8,
+      upper:  pw.match?(/[A-Z]/),
+      lower:  pw.match?(/[a-z]/),
+      digit:  pw.match?(/[0-9]/),
+      symbol: pw.match?(/[^A-Za-z0-9]/)
+    }
+    met = reqs.values.count(true)
+    if pw.empty?
+      s_lbl.markup = "<small><b><span foreground='#999999'>No password entered</span></b></small>"
+    else
+      st_label, st_color = case met
+        when 0..1 then ['Very Weak',   '#e53935']
+        when 2    then ['Weak',        '#f57c00']
+        when 3    then ['Moderate',    '#f9a825']
+        when 4    then ['Strong',      '#7cb342']
+        else           ['Very Strong', '#2e7d32']
+      end
+      s_lbl.markup = "<small><b><span foreground='#{st_color}'>#{st_label}</span></b></small>"
+    end
+    parts = [
+      [reqs[:length], '8+ chars'],
+      [reqs[:upper],  'Uppercase'],
+      [reqs[:lower],  'Lowercase'],
+      [reqs[:digit],  'Number'],
+      [reqs[:symbol], 'Symbol']
+    ].map { |met, label|
+      color = met ? '#7cb342' : '#e53935'
+      mark  = met ? '✓' : '✗'
+      "<span foreground='#{color}'>#{mark} #{esc label}</span>"
+    }.join('   ')
+    r_lbl.markup = "<small>#{parts}</small>"
+  end
+
+  pass_e.signal_connect('changed') { update.call }
+  update.call  # run once immediately so GTK allocates label space from the start
+  update       # return lambda
+end
+
 # =============================================================================
 # Credential Form Dialog (Add / Edit)
 # =============================================================================
@@ -891,9 +1013,9 @@ def open_entry_dialog(parent, entry = nil)
   end
 
   pass_row = Gtk::Box.new(:horizontal, 4)
-  pass_row.pack_start(pass_e,    expand: true,  fill: true,  padding: 0)
-  pass_row.pack_start(show_btn,  expand: false, fill: false, padding: 0)
-  pass_row.pack_start(gen_btn,   expand: false, fill: false, padding: 0)
+  pass_row.pack_start(pass_e,   expand: true,  fill: true,  padding: 0)
+  pass_row.pack_start(show_btn, expand: false, fill: false, padding: 0)
+  pass_row.pack_start(gen_btn,  expand: false, fill: false, padding: 0)
   pass_row.hexpand = true
 
   rows = [
@@ -911,6 +1033,9 @@ def open_entry_dialog(parent, entry = nil)
   end
 
   area.pack_start(grid, expand: false, fill: false, padding: 0)
+
+  strength_update = build_strength_indicator(area, pass_e)
+  gen_btn.signal_connect('clicked') { strength_update.call }
 
   notes_lbl = Gtk::Label.new('Notes')
   notes_lbl.xalign = 0
@@ -1109,10 +1234,13 @@ end
 # =============================================================================
 class App
   def initialize
-    @vault         = Vault.new
-    @selected_id   = nil
-    @search_query  = ''
-    @current_theme = load_theme_preference
+    @vault            = Vault.new
+    @selected_id      = nil
+    @search_query     = ''
+    @current_theme    = load_theme_preference
+    @login_attempts   = 0
+    @lockout_count, @locked_until = load_lockout_state
+    @inactivity_timer = nil
     apply_css
     build_window
     apply_theme(@current_theme)
@@ -1134,6 +1262,17 @@ class App
       @theme_btn.tooltip_text = dark ? 'Switch to light mode' : 'Switch to dark mode'
     end
     save_theme_preference(mode)
+  end
+
+  def reset_inactivity_timer
+    GLib::Source.remove(@inactivity_timer) if @inactivity_timer
+    @inactivity_timer = GLib::Timeout.add(INACTIVITY_MINUTES * 60 * 1000) do
+      unless @vault.locked?
+        do_lock
+      end
+      @inactivity_timer = nil
+      false
+    end
   end
 
   def toggle_theme
@@ -1215,6 +1354,7 @@ class App
     @win.add(root)
 
     @win.signal_connect('key-press-event') do |_, ev|
+      reset_inactivity_timer
       if ev.state.control_mask?
         case ev.keyval
         when Gdk::Keyval::KEY_n then do_add
@@ -1223,6 +1363,8 @@ class App
         end
       end
     end
+
+    @win.signal_connect('button-press-event') { reset_inactivity_timer }
   end
 
   def build_list_panel
@@ -1348,6 +1490,8 @@ class App
   end
 
   def do_lock
+    GLib::Source.remove(@inactivity_timer) if @inactivity_timer
+    @inactivity_timer = nil
     @vault.lock!
     @hbar.subtitle = 'Password Manager'
     @win.hide
@@ -1357,6 +1501,14 @@ class App
   def show_auth_screen
     loop do
       if @vault.exists?
+        # Enforce lockout before showing dialog
+        if @locked_until && Time.now < @locked_until
+          remaining = (@locked_until - Time.now).ceil
+          show_error_dialog(nil, 'Vault is locked',
+            "Too many failed attempts. Try again in #{format_remaining(remaining)}.")
+          next
+        end
+
         result = open_master_dialog
 
         case result
@@ -1370,10 +1522,27 @@ class App
           un = result[:username]
           pw = result[:password]
           if @vault.unlock(un, pw)
+            @login_attempts = 0
+            @lockout_count  = 0
+            @locked_until   = nil
+            clear_lockout_state
             result[:remember] ? save_remembered_username(un) : clear_remembered_username
             break
           else
-            show_error_dialog(nil, 'Incorrect username or password', 'Please try again.')
+            @login_attempts += 1
+            if @login_attempts >= MAX_LOGIN_ATTEMPTS
+              @lockout_count += 1
+              duration       = LOCKOUT_DURATIONS[[@lockout_count - 1, LOCKOUT_DURATIONS.length - 1].min]
+              @locked_until  = Time.now + duration
+              @login_attempts = 0
+              save_lockout_state(@lockout_count, @locked_until)
+              show_error_dialog(nil, 'Too many failed attempts',
+                "Vault locked for #{format_duration(duration)}.")
+            else
+              left = MAX_LOGIN_ATTEMPTS - @login_attempts
+              show_error_dialog(nil, 'Incorrect username or password',
+                "#{left} attempt#{left == 1 ? '' : 's'} remaining before lockout.")
+            end
           end
         end
       else
@@ -1390,6 +1559,7 @@ class App
     @hbar.subtitle = "Welcome back, #{@vault.username}!"
     @win.show_all
     refresh_list
+    reset_inactivity_timer
     msg = @vault.entries.empty? ?
       'Vault ready – click ＋ to add your first credential' :
       "#{@vault.entries.size} credential#{@vault.entries.size == 1 ? '' : 's'} loaded"
