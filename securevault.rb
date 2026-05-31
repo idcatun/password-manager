@@ -24,6 +24,7 @@ IV_BYTES          = 16
 VAULT_DIR         = File.join(Dir.home, '.securevault')
 VAULT_FILE        = File.join(VAULT_DIR, 'vault.dat')
 META_FILE         = File.join(VAULT_DIR, 'vault.meta')
+REMEMBER_FILE     = File.join(VAULT_DIR, 'remember')
 APP_TITLE         = 'SecureVault'
 
 # Fixed set of security questions (user answers first 3)
@@ -174,9 +175,10 @@ class Vault
     persist!
   end
 
-  def unlock(password)
+  def unlock(username, password)
     return false unless exists?
     meta        = load_meta
+    return false unless meta['username'] == username
     master_salt = Base64.strict_decode64(meta['master_salt'])
     master_key  = Crypto.derive_key(password, master_salt)
     vkey        = Crypto.decrypt_raw(meta['master_blob'], master_key)
@@ -345,6 +347,22 @@ def status_flash(statusbar, ctx_id, msg, seconds: 4)
   GLib::Timeout.add(seconds * 1000) { statusbar.pop(ctx_id); false }
 end
 
+def remembered_username
+  File.read(REMEMBER_FILE, encoding: 'UTF-8').strip
+rescue StandardError
+  nil
+end
+
+def save_remembered_username(username)
+  File.write(REMEMBER_FILE, username, encoding: 'UTF-8')
+rescue StandardError
+end
+
+def clear_remembered_username
+  File.delete(REMEMBER_FILE) if File.exist?(REMEMBER_FILE)
+rescue StandardError
+end
+
 def show_error_dialog(parent, message, secondary = nil)
   d = Gtk::MessageDialog.new(
     parent: parent, flags: :modal,
@@ -506,9 +524,11 @@ def open_setup_dialog
     else
       saved_username = un
       saved_password = pw
+      pos = d.position
       phase1.hide
       phase2.show
       d.resize(520, 1)
+      d.move(*pos)
       ok_btn.sensitive = true
     end
   end
@@ -545,9 +565,11 @@ end
 
 # =============================================================================
 # Master Password / Unlock Dialog
-# Returns: password string on success, :forgot if forgot-password clicked, nil on quit
+# Returns: {username:, password:, remember:} on success, :forgot, or nil on quit
 # =============================================================================
-def open_master_dialog(username: nil, error_msg: nil)
+def open_master_dialog(error_msg: nil)
+  remembered = remembered_username
+
   d = Gtk::Dialog.new(title: "Unlock #{APP_TITLE}", parent: nil, flags: [])
   d.set_default_size(430, -1)
   d.set_position(:center)
@@ -563,20 +585,20 @@ def open_master_dialog(username: nil, error_msg: nil)
 
   hbox    = Gtk::Box.new(:vertical, 4)
   title_l = Gtk::Label.new
-  title_l.markup = username ?
-    "<b><big>Welcome back, #{esc username}!</big></b>" :
+  title_l.markup = remembered ?
+    "<b><big>Welcome back, #{esc remembered}!</big></b>" :
     '<b><big>Unlock Your Vault</big></b>'
   title_l.xalign = 0
 
   sub_l = Gtk::Label.new
-  sub_l.markup = '<small>Enter your master password to access your credentials.</small>'
+  sub_l.markup = '<small>Enter your username and master password to continue.</small>'
   sub_l.xalign = 0
   sub_l.wrap   = true
 
   hbox.pack_start(title_l, expand: false)
   hbox.pack_start(sub_l,   expand: false)
   top.pack_start(hbox, expand: true, fill: true, padding: 0)
-  area.pack_start(top,                              expand: false, fill: false, padding: 0)
+  area.pack_start(top,                             expand: false, fill: false, padding: 0)
   area.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 0)
 
   mk_row = lambda { |label_text, entry_widget|
@@ -589,6 +611,12 @@ def open_master_dialog(username: nil, error_msg: nil)
     row
   }
 
+  user_e = Gtk::Entry.new
+  user_e.placeholder_text  = 'Username'
+  user_e.hexpand           = true
+  user_e.text              = remembered || ''
+  area.pack_start(mk_row.call('Username:', user_e), expand: false, fill: false, padding: 0)
+
   pass_e = Gtk::Entry.new
   pass_e.visibility        = false
   pass_e.placeholder_text  = 'Master password'
@@ -596,12 +624,15 @@ def open_master_dialog(username: nil, error_msg: nil)
   pass_e.hexpand           = true
   area.pack_start(mk_row.call('Password:', pass_e), expand: false, fill: false, padding: 0)
 
+  remember_cb = Gtk::CheckButton.new('Remember me')
+  remember_cb.active = !remembered.nil?
+  area.pack_start(remember_cb, expand: false, fill: false, padding: 0)
+
   err_lbl = Gtk::Label.new
   err_lbl.xalign = 0
   err_lbl.markup = "<span foreground='red'>#{esc error_msg}</span>" if error_msg
   area.pack_start(err_lbl, expand: false, fill: false, padding: 0)
 
-  # "Forgot password?" sends a HELP response to avoid nested dialogs
   forgot_btn = Gtk::Button.new(label: 'Forgot password?')
   forgot_btn.relief = :none
   forgot_btn.signal_connect('clicked') { d.response(Gtk::ResponseType::HELP) }
@@ -611,19 +642,29 @@ def open_master_dialog(username: nil, error_msg: nil)
   ok_btn = d.add_button('Unlock', Gtk::ResponseType::OK)
   ok_btn.style_context.add_class('suggested-action')
   d.default_response = Gtk::ResponseType::OK
+
+  # If username is pre-filled, jump focus to password
+  pass_e.grab_focus if remembered
+
   d.show_all
 
   loop do
     resp = d.run
     case resp
     when Gtk::ResponseType::OK
+      un = user_e.text.strip
       pw = pass_e.text
+      if un.empty?
+        err_lbl.markup = "<span foreground='red'>⚠ Username cannot be empty</span>"
+        next
+      end
       if pw.empty?
         err_lbl.markup = "<span foreground='red'>⚠ Password cannot be empty</span>"
         next
       end
+      remember = remember_cb.active?
       d.destroy
-      return pw
+      return { username: un, password: pw, remember: remember }
     when Gtk::ResponseType::HELP
       d.destroy
       return :forgot
@@ -741,9 +782,11 @@ def open_forgot_dialog(vault)
       err1.markup = "<span foreground='red'>⚠ Please answer all questions</span>"
     elsif vault.verify_answers(answers)
       verified_answers = answers
+      pos = d.position
       phase1.hide
       phase2.show
       d.resize(480, 1)
+      d.move(*pos)
       reset_btn.sensitive = true
       new_pass_e.grab_focus
     else
@@ -1054,7 +1097,8 @@ class App
     @search_query = ''
     apply_css
     build_window
-    show_auth_screen
+    # Schedule auth after Gtk.main starts so Gtk.main_quit works correctly
+    GLib::Idle.add { show_auth_screen; false }
   end
 
   def run
@@ -1079,26 +1123,26 @@ class App
     @win.set_position(:center)
     @win.signal_connect('delete-event') { Gtk.main_quit; false }
 
-    hbar = Gtk::HeaderBar.new
-    hbar.title             = APP_TITLE
-    hbar.subtitle          = 'Password Manager'
-    hbar.show_close_button = true
-    @win.set_titlebar(hbar)
+    @hbar = Gtk::HeaderBar.new
+    @hbar.title             = APP_TITLE
+    @hbar.subtitle          = 'Password Manager'
+    @hbar.show_close_button = true
+    @win.set_titlebar(@hbar)
 
     @add_btn = Gtk::Button.new
     @add_btn.image        = Gtk::Image.new(icon_name: 'list-add-symbolic', icon_size: :button)
     @add_btn.tooltip_text = 'Add credential  (Ctrl+N)'
     @add_btn.signal_connect('clicked') { do_add }
-    hbar.pack_start(@add_btn)
+    @hbar.pack_start(@add_btn)
 
     lock_btn = Gtk::Button.new
     lock_btn.image        = Gtk::Image.new(icon_name: 'changes-prevent-symbolic', icon_size: :button)
     lock_btn.tooltip_text = 'Lock vault  (Ctrl+L)'
     lock_btn.signal_connect('clicked') { do_lock }
-    hbar.pack_end(lock_btn)
+    @hbar.pack_end(lock_btn)
 
     @count_lbl = Gtk::Label.new('0 entries')
-    hbar.pack_end(@count_lbl)
+    @hbar.pack_end(@count_lbl)
 
     root = Gtk::Box.new(:vertical, 0)
 
@@ -1267,6 +1311,7 @@ class App
 
   def do_lock
     @vault.lock!
+    @hbar.subtitle = 'Password Manager'
     @win.hide
     show_auth_screen
   end
@@ -1274,33 +1319,26 @@ class App
   def show_auth_screen
     loop do
       if @vault.exists?
-        # Read stored username for the welcome message
-        username = begin
-          JSON.parse(File.read(META_FILE, encoding: 'UTF-8'))['username']
-        rescue StandardError
-          nil
-        end
-
-        result = open_master_dialog(username: username)
+        result = open_master_dialog
 
         case result
         when nil
           Gtk.main_quit
           return
         when :forgot
-          if open_forgot_dialog(@vault)
-            # Password was reset; loop back to unlock dialog
-          end
+          open_forgot_dialog(@vault)
           next
         else
-          if @vault.unlock(result)
+          un = result[:username]
+          pw = result[:password]
+          if @vault.unlock(un, pw)
+            result[:remember] ? save_remembered_username(un) : clear_remembered_username
             break
           else
-            show_error_dialog(nil, 'Incorrect master password', 'Please try again.')
+            show_error_dialog(nil, 'Incorrect username or password', 'Please try again.')
           end
         end
       else
-        # First run — collect username, password, security questions
         setup_data = open_setup_dialog
         unless setup_data
           Gtk.main_quit
@@ -1311,11 +1349,12 @@ class App
       end
     end
 
+    @hbar.subtitle = "Welcome back, #{@vault.username}!"
     @win.show_all
     refresh_list
     msg = @vault.entries.empty? ?
       'Vault ready – click ＋ to add your first credential' :
-      "Welcome back, #{@vault.username}!"
+      "#{@vault.entries.size} credential#{@vault.entries.size == 1 ? '' : 's'} loaded"
     status_flash(@statusbar, @sb_ctx, msg)
   end
 end
