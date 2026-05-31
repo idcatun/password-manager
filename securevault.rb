@@ -508,13 +508,13 @@ def open_setup_dialog
   pass_e.visibility       = false
   pass_e.placeholder_text = 'Master password (min 8 characters)'
   pass_e.hexpand          = true
-  phase1.pack_start(mk_row.call('Password:', pass_e), expand: false, fill: false, padding: 0)
+  phase1.pack_start(mk_row.call('Password:', password_row_with_toggle(pass_e)), expand: false, fill: false, padding: 0)
 
   confirm_e = Gtk::Entry.new
   confirm_e.visibility       = false
   confirm_e.placeholder_text = 'Confirm password'
   confirm_e.hexpand          = true
-  phase1.pack_start(mk_row.call('Confirm:', confirm_e), expand: false, fill: false, padding: 0)
+  phase1.pack_start(mk_row.call('Confirm:', password_row_with_toggle(confirm_e)), expand: false, fill: false, padding: 0)
 
   build_strength_indicator(phase1, pass_e)
 
@@ -698,7 +698,7 @@ def open_master_dialog(error_msg: nil)
   pass_e.placeholder_text  = 'Master password'
   pass_e.activates_default = true
   pass_e.hexpand           = true
-  area.pack_start(mk_row.call('Password:', pass_e), expand: false, fill: false, padding: 0)
+  area.pack_start(mk_row.call('Password:', password_row_with_toggle(pass_e)), expand: false, fill: false, padding: 0)
 
   remember_cb = Gtk::CheckButton.new('Remember me')
   remember_cb.active = !remembered.nil?
@@ -830,7 +830,7 @@ def open_forgot_dialog(vault)
   new_pass_e.visibility       = false
   new_pass_e.placeholder_text = 'New master password (min 8 characters)'
   new_pass_e.hexpand          = true
-  phase2.pack_start(mk_row.call('Password:', new_pass_e), expand: false, fill: false, padding: 0)
+  phase2.pack_start(mk_row.call('Password:', password_row_with_toggle(new_pass_e)), expand: false, fill: false, padding: 0)
 
   build_strength_indicator(phase2, new_pass_e)
 
@@ -838,7 +838,7 @@ def open_forgot_dialog(vault)
   new_confirm_e.visibility       = false
   new_confirm_e.placeholder_text = 'Confirm new password'
   new_confirm_e.hexpand          = true
-  phase2.pack_start(mk_row.call('Confirm:', new_confirm_e), expand: false, fill: false, padding: 0)
+  phase2.pack_start(mk_row.call('Confirm:', password_row_with_toggle(new_confirm_e)), expand: false, fill: false, padding: 0)
 
   err2 = Gtk::Label.new
   err2.xalign = 0
@@ -965,9 +965,21 @@ def build_strength_indicator(container, pass_e)
   update       # return lambda
 end
 
-# =============================================================================
-# Credential Form Dialog (Add / Edit)
-# =============================================================================
+# Wraps a password entry with a show/hide toggle button.
+def password_row_with_toggle(pass_e)
+  btn = Gtk::ToggleButton.new
+  btn.image        = Gtk::Image.new(icon_name: 'view-reveal-symbolic', icon_size: :button)
+  btn.tooltip_text = 'Show / hide password'
+  btn.relief       = :none
+  btn.signal_connect('toggled') { |b| pass_e.visibility = b.active? }
+  box = Gtk::Box.new(:horizontal, 4)
+  box.pack_start(pass_e, expand: true,  fill: true,  padding: 0)
+  box.pack_start(btn,    expand: false, fill: false, padding: 0)
+  box.hexpand = true
+  box
+end
+
+
 def open_entry_dialog(parent, entry = nil)
   editing = !entry.nil?
   d = Gtk::Dialog.new(
@@ -1552,6 +1564,10 @@ class App
           return
         end
         @vault.create!(**setup_data)
+        @login_attempts = 0
+        @lockout_count  = 0
+        @locked_until   = nil
+        clear_lockout_state
         break
       end
     end
