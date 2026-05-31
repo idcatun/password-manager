@@ -4,6 +4,7 @@
 # =============================================================================
 # SecureVault Password Manager
 # GUI: GTK3 | Encryption: AES-256-CBC | Key Derivation: PBKDF2-HMAC-SHA256
+# Auth: KEK architecture (vault key separate from master password derived key)
 # =============================================================================
 
 require 'gtk3'
@@ -16,98 +17,225 @@ require 'fileutils'
 # =============================================================================
 # Security Parameters
 # =============================================================================
-PBKDF2_ITERATIONS = 100_000        # NIST recommended minimum
-KEY_BYTES         = 32             # 256-bit key for AES-256
-SALT_BYTES        = 32             # 256-bit random salt
-IV_BYTES          = 16             # 128-bit AES block size
+PBKDF2_ITERATIONS = 100_000
+KEY_BYTES         = 32
+SALT_BYTES        = 32
+IV_BYTES          = 16
 VAULT_DIR         = File.join(Dir.home, '.securevault')
 VAULT_FILE        = File.join(VAULT_DIR, 'vault.dat')
-SALT_FILE         = File.join(VAULT_DIR, 'vault.salt')
+META_FILE         = File.join(VAULT_DIR, 'vault.meta')
 APP_TITLE         = 'SecureVault'
+
+# Fixed set of security questions (user answers first 3)
+SECURITY_QUESTION_POOL = [
+  'What was the name of your first pet?',
+  'What city were you born in?',
+  "What is your mother's maiden name?",
+  'What was the name of your elementary school?',
+  'What was your childhood nickname?',
+  'What is the name of the street you grew up on?',
+  'What was the make of your first car?',
+  "What is your oldest sibling's middle name?",
+  'What was the name of your childhood best friend?',
+  'In what city did you meet your spouse or significant other?',
+  'What was the name of the hospital where you were born?',
+  'What is the middle name of your youngest child?'
+].freeze
 
 # =============================================================================
 # Crypto – AES-256-CBC with PBKDF2-HMAC-SHA256 key derivation
 # =============================================================================
 module Crypto
-  # Derives a 256-bit key from the master password using PBKDF2-HMAC-SHA256.
-  # This is significantly stronger than a raw SHA-256 hash because it is
-  # intentionally slow (100k iterations), making brute-force attacks expensive.
   def self.derive_key(password, salt)
     OpenSSL::PKCS5.pbkdf2_hmac(
-      password,
-      salt,
-      PBKDF2_ITERATIONS,
-      KEY_BYTES,
-      OpenSSL::Digest::SHA256.new
+      password, salt, PBKDF2_ITERATIONS, KEY_BYTES, OpenSSL::Digest::SHA256.new
     )
   end
 
-  # Encrypts plaintext with AES-256-CBC. Prepends a random IV to the ciphertext
-  # and returns the whole payload as a Base64 string.
+  # Encrypt a UTF-8 string → Base64 blob
   def self.encrypt(plaintext, key)
     cipher = OpenSSL::Cipher.new('AES-256-CBC')
     cipher.encrypt
     iv         = cipher.random_iv
     cipher.key = key
-    ciphertext = cipher.update(plaintext.encode('UTF-8')) + cipher.final
-    Base64.strict_encode64(iv + ciphertext)
+    ct         = cipher.update(plaintext.encode('UTF-8')) + cipher.final
+    Base64.strict_encode64(iv + ct)
   end
 
-  # Decrypts a Base64-encoded payload produced by #encrypt.
+  # Decrypt a Base64 blob → UTF-8 string
   def self.decrypt(encoded, key)
     raw        = Base64.strict_decode64(encoded)
     iv         = raw[0, IV_BYTES]
-    ciphertext = raw[IV_BYTES..]
+    ct         = raw[IV_BYTES..]
     cipher     = OpenSSL::Cipher.new('AES-256-CBC')
     cipher.decrypt
     cipher.key = key
     cipher.iv  = iv
-    cipher.update(ciphertext) + cipher.final
+    cipher.update(ct) + cipher.final
   rescue OpenSSL::Cipher::CipherError
     raise ArgumentError, 'Decryption failed – wrong password or corrupted data'
+  end
+
+  # Encrypt raw binary data (used for vault key wrapping) → Base64 blob
+  def self.encrypt_raw(binary, key)
+    cipher = OpenSSL::Cipher.new('AES-256-CBC')
+    cipher.encrypt
+    iv         = cipher.random_iv
+    cipher.key = key
+    ct         = cipher.update(binary) + cipher.final
+    Base64.strict_encode64(iv + ct)
+  end
+
+  # Decrypt Base64 blob → raw binary
+  def self.decrypt_raw(encoded, key)
+    raw        = Base64.strict_decode64(encoded)
+    iv         = raw[0, IV_BYTES]
+    ct         = raw[IV_BYTES..]
+    cipher     = OpenSSL::Cipher.new('AES-256-CBC')
+    cipher.decrypt
+    cipher.key = key
+    cipher.iv  = iv
+    (cipher.update(ct) + cipher.final).b
+  rescue OpenSSL::Cipher::CipherError
+    raise ArgumentError, 'Decryption failed'
+  end
+
+  # Constant-time comparison to prevent timing attacks
+  def self.secure_compare(a, b)
+    return false unless a.bytesize == b.bytesize
+    OpenSSL.fixed_length_secure_compare(a, b)
+  rescue StandardError
+    a == b
   end
 end
 
 # =============================================================================
-# Vault – Encrypted JSON credential store on disk
+# Vault – KEK Architecture
+#
+# The vault key (vkey) is a random 32-byte value generated once at vault
+# creation and never changes. It encrypts the credential data. Access to the
+# vkey is controlled by two separate "envelopes":
+#
+#   master_blob  – vkey encrypted with a key derived from the master password
+#   recovery_blob – vkey encrypted with a key derived from security Q&A answers
+#
+# Changing the master password only updates master_blob; the vkey and the
+# encrypted data are untouched. Recovery works by decrypting recovery_blob.
 # =============================================================================
 class Vault
-  attr_reader :entries
+  attr_reader :entries, :username
 
   def initialize
-    @entries = []
-    @key     = nil
+    @entries  = []
+    @vkey     = nil
+    @username = nil
     FileUtils.mkdir_p(VAULT_DIR)
   end
 
-  def exists?  = File.exist?(VAULT_FILE) && File.exist?(SALT_FILE)
-  def locked?  = @key.nil?
+  def exists? = File.exist?(VAULT_FILE) && File.exist?(META_FILE)
+  def locked? = @vkey.nil?
 
-  # Creates a brand-new vault protected by +password+.
-  def create!(password)
-    salt = OpenSSL::Random.random_bytes(SALT_BYTES)
-    File.binwrite(SALT_FILE, salt)
-    @key     = Crypto.derive_key(password, salt)
-    @entries = []
+  # Create a new vault.
+  # sq_data: [{question: String, answer: String}, ...]
+  def create!(username:, password:, sq_data:)
+    vkey        = OpenSSL::Random.random_bytes(KEY_BYTES)
+    master_salt = OpenSSL::Random.random_bytes(SALT_BYTES)
+    master_key  = Crypto.derive_key(password, master_salt)
+    master_blob = Crypto.encrypt_raw(vkey, master_key)
+
+    rec_salt   = OpenSSL::Random.random_bytes(SALT_BYTES)
+    ans_concat = sq_data.map { |q| q[:answer].strip.downcase }.join('|')
+    rec_key    = Crypto.derive_key(ans_concat, rec_salt)
+    rec_blob   = Crypto.encrypt_raw(vkey, rec_key)
+
+    questions = sq_data.map do |q|
+      ans_salt = OpenSSL::Random.random_bytes(SALT_BYTES)
+      ans_hash = Crypto.derive_key(q[:answer].strip.downcase, ans_salt)
+      {
+        'question'    => q[:question],
+        'answer_hash' => Base64.strict_encode64(ans_hash),
+        'answer_salt' => Base64.strict_encode64(ans_salt)
+      }
+    end
+
+    meta = {
+      'username'           => username,
+      'master_salt'        => Base64.strict_encode64(master_salt),
+      'master_blob'        => master_blob,
+      'recovery_salt'      => Base64.strict_encode64(rec_salt),
+      'recovery_blob'      => rec_blob,
+      'security_questions' => questions
+    }
+    File.write(META_FILE, JSON.generate(meta), encoding: 'UTF-8')
+
+    @vkey     = vkey
+    @username = username
+    @entries  = []
     persist!
   end
 
-  # Unlocks the existing vault. Returns true on success, false on wrong password.
   def unlock(password)
     return false unless exists?
-    salt      = File.binread(SALT_FILE)
-    candidate = Crypto.derive_key(password, salt)
-    raw       = Crypto.decrypt(File.read(VAULT_FILE, encoding: 'UTF-8'), candidate)
-    @entries  = JSON.parse(raw)
-    @key      = candidate
+    meta        = load_meta
+    master_salt = Base64.strict_decode64(meta['master_salt'])
+    master_key  = Crypto.derive_key(password, master_salt)
+    vkey        = Crypto.decrypt_raw(meta['master_blob'], master_key)
+    raw         = Crypto.decrypt(File.read(VAULT_FILE, encoding: 'UTF-8'), vkey)
+    @entries    = JSON.parse(raw)
+    @vkey       = vkey
+    @username   = meta['username']
     true
   rescue ArgumentError, JSON::ParserError
     false
   end
 
   def lock!
-    @entries = []
-    @key     = nil
+    @entries  = []
+    @vkey     = nil
+    @username = nil
+  end
+
+  def security_questions
+    return [] unless File.exist?(META_FILE)
+    load_meta['security_questions'].map { |q| q['question'] }
+  rescue StandardError
+    []
+  end
+
+  # Returns true if every answer matches its stored hash.
+  def verify_answers(answers)
+    return false unless File.exist?(META_FILE)
+    sq = load_meta['security_questions']
+    return false unless sq.length == answers.length
+    sq.each_with_index.all? do |q, i|
+      ans_salt = Base64.strict_decode64(q['answer_salt'])
+      expected = Base64.strict_decode64(q['answer_hash'])
+      actual   = Crypto.derive_key(answers[i].strip.downcase, ans_salt)
+      Crypto.secure_compare(expected, actual)
+    end
+  rescue StandardError
+    false
+  end
+
+  # Decrypt recovery_blob with answers, re-wrap vkey under new master password.
+  def reset_password!(answers, new_password)
+    return false unless File.exist?(META_FILE)
+    meta      = load_meta
+    rec_salt  = Base64.strict_decode64(meta['recovery_salt'])
+    ac        = answers.map { |a| a.strip.downcase }.join('|')
+    rec_key   = Crypto.derive_key(ac, rec_salt)
+    vkey      = Crypto.decrypt_raw(meta['recovery_blob'], rec_key)
+
+    new_salt  = OpenSSL::Random.random_bytes(SALT_BYTES)
+    new_key   = Crypto.derive_key(new_password, new_salt)
+    new_blob  = Crypto.encrypt_raw(vkey, new_key)
+
+    meta['master_salt'] = Base64.strict_encode64(new_salt)
+    meta['master_blob'] = new_blob
+    File.write(META_FILE, JSON.generate(meta), encoding: 'UTF-8')
+    true
+  rescue ArgumentError
+    false
   end
 
   def add_entry(name:, username:, password:, url: '', notes: '')
@@ -152,9 +280,13 @@ class Vault
 
   private
 
+  def load_meta
+    JSON.parse(File.read(META_FILE, encoding: 'UTF-8'))
+  end
+
   def persist!
     raise 'Vault is locked' if locked?
-    File.write(VAULT_FILE, Crypto.encrypt(JSON.generate(@entries), @key), encoding: 'UTF-8')
+    File.write(VAULT_FILE, Crypto.encrypt(JSON.generate(@entries), @vkey), encoding: 'UTF-8')
   end
 end
 
@@ -174,7 +306,7 @@ module PasswordGen
     if digits;  pool += DIGITS;  required << rand_from(DIGITS);  end
     if symbols; pool += SYMBOLS; required << rand_from(SYMBOLS); end
     fill = Array.new([0, length - required.size].max) { rand_from(pool) }
-    (required + fill).shuffle { SecureRandom.random_number }.join
+    (required + fill).shuffle.join
   end
 
   def self.rand_from(arr)
@@ -197,7 +329,7 @@ APP_CSS = <<~CSS
 CSS
 
 # =============================================================================
-# Utility helpers (module-level, used throughout)
+# Utility helpers
 # =============================================================================
 
 def esc(str)
@@ -238,123 +370,216 @@ def show_confirm_dialog(parent, message, secondary = nil)
 end
 
 # =============================================================================
-# Password Generator Dialog
+# Setup Dialog – shown once when creating a new vault
+# Phase 1: username + password  →  Phase 2: security questions (dropdowns)
 # =============================================================================
-def open_generator_dialog(parent)
-  d = Gtk::Dialog.new(
-    title: 'Password Generator',
-    parent: parent,
-    flags: [:modal, :destroy_with_parent]
-  )
-  d.set_default_size(400, 295)
-
-  area = d.child
-  area.margin = 16
-  area.spacing = 8
-
-  # Length row
-  len_box = Gtk::Box.new(:horizontal, 8)
-  lbl = Gtk::Label.new('Length:')
-  lbl.xalign = 1.0
-  lbl.width_chars = 10
-  len_spin = Gtk::SpinButton.new_with_range(8, 64, 1)
-  len_spin.value = 16
-  len_box.pack_start(lbl,      expand: false, fill: false, padding: 0)
-  len_box.pack_start(len_spin, expand: false, fill: false, padding: 0)
-  area.pack_start(len_box, expand: false, fill: false, padding: 0)
-
-  # Option checkboxes
-  upper_cb   = Gtk::CheckButton.new(label: 'Uppercase letters  (A–Z)')
-  digits_cb  = Gtk::CheckButton.new(label: 'Digits  (0–9)')
-  symbols_cb = Gtk::CheckButton.new(label: 'Symbols  (!@#$…)')
-  [upper_cb, digits_cb, symbols_cb].each do |cb|
-    cb.active = true
-    area.pack_start(cb, expand: false, fill: false, padding: 0)
-  end
-
-  area.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
-
-  # Preview row
-  prev_row = Gtk::Box.new(:horizontal, 6)
-  prev_e   = Gtk::Entry.new
-  prev_e.editable = false
-  prev_e.hexpand  = true
-  prev_e.style_context.add_class('monospace')
-  regen_btn = Gtk::Button.new(label: '↺  New')
-  regen_btn.tooltip_text = 'Generate another'
-  prev_row.pack_start(prev_e,    expand: true,  fill: true,  padding: 0)
-  prev_row.pack_start(regen_btn, expand: false, fill: false, padding: 0)
-  area.pack_start(prev_row, expand: false, fill: false, padding: 0)
-
-  regenerate = lambda {
-    prev_e.text = PasswordGen.generate(
-      length:  len_spin.value.to_i,
-      upper:   upper_cb.active?,
-      digits:  digits_cb.active?,
-      symbols: symbols_cb.active?
-    )
-  }
-
-  regen_btn.signal_connect('clicked')       { regenerate.call }
-  len_spin.signal_connect('value-changed')  { regenerate.call }
-  [upper_cb, digits_cb, symbols_cb].each { |cb| cb.signal_connect('toggled') { regenerate.call } }
-  regenerate.call
-
-  d.add_button('Cancel', Gtk::ResponseType::CANCEL)
-  ok_btn = d.add_button('Use This Password', Gtk::ResponseType::OK)
-  ok_btn.style_context.add_class('suggested-action')
-  d.default_response = Gtk::ResponseType::OK
-  d.show_all
-
-  result = nil
-  result = prev_e.text if d.run == Gtk::ResponseType::OK
-  d.destroy
-  result
-end
-
-# =============================================================================
-# Master Password Dialog  (new vault creation OR unlock)
-# =============================================================================
-def open_master_dialog(new_vault:, error_msg: nil)
-  d = Gtk::Dialog.new(
-    title:  new_vault ? 'Create New Vault' : "Unlock #{APP_TITLE}",
-    parent: nil,
-    flags:  []
-  )
-  d.set_default_size(430, new_vault ? 275 : 215)
+def open_setup_dialog
+  d = Gtk::Dialog.new(title: 'Create New Vault', parent: nil, flags: [])
+  d.set_default_size(520, -1)
   d.set_position(:center)
   d.deletable = false
 
   area = d.child
   area.margin = 20
-  area.spacing = 12
+  area.spacing = 8
 
-  # Icon + heading
+  mk_row = lambda { |label_text, widget|
+    row = Gtk::Box.new(:horizontal, 8)
+    l = Gtk::Label.new(label_text)
+    l.width_chars = 12
+    l.xalign      = 1.0
+    row.pack_start(l,      expand: false, fill: false, padding: 0)
+    row.pack_start(widget, expand: true,  fill: true,  padding: 0)
+    row
+  }
+
+  # ── Phase 1: Credentials ──────────────────────────────────────────────────
+  phase1 = Gtk::Box.new(:vertical, 8)
+
+  p1_title = Gtk::Label.new
+  p1_title.markup = '<b><big>Create Your Vault</big></b>'
+  p1_title.xalign = 0
+  p1_sub = Gtk::Label.new
+  p1_sub.markup = '<small>Choose a username and a strong master password.</small>'
+  p1_sub.xalign = 0
+  p1_sub.wrap   = true
+  phase1.pack_start(p1_title, expand: false, fill: false, padding: 0)
+  phase1.pack_start(p1_sub,   expand: false, fill: false, padding: 0)
+  phase1.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
+
+  user_e = Gtk::Entry.new
+  user_e.placeholder_text = 'Your vault username'
+  user_e.hexpand          = true
+  phase1.pack_start(mk_row.call('Username:', user_e), expand: false, fill: false, padding: 0)
+
+  pass_e = Gtk::Entry.new
+  pass_e.visibility       = false
+  pass_e.placeholder_text = 'Master password (min 8 characters)'
+  pass_e.hexpand          = true
+  phase1.pack_start(mk_row.call('Password:', pass_e), expand: false, fill: false, padding: 0)
+
+  confirm_e = Gtk::Entry.new
+  confirm_e.visibility       = false
+  confirm_e.placeholder_text = 'Confirm password'
+  confirm_e.hexpand          = true
+  phase1.pack_start(mk_row.call('Confirm:', confirm_e), expand: false, fill: false, padding: 0)
+
+  err1 = Gtk::Label.new
+  err1.xalign = 0
+  phase1.pack_start(err1, expand: false, fill: false, padding: 0)
+
+  continue_btn = Gtk::Button.new(label: 'Continue →')
+  continue_btn.style_context.add_class('suggested-action')
+  phase1.pack_start(continue_btn, expand: false, fill: false, padding: 0)
+
+  area.pack_start(phase1, expand: false, fill: false, padding: 0)
+
+  # ── Phase 2: Security Questions ───────────────────────────────────────────
+  phase2 = Gtk::Box.new(:vertical, 8)
+
+  p2_title = Gtk::Label.new
+  p2_title.markup = '<b><big>Security Questions</big></b>'
+  p2_title.xalign = 0
+  p2_sub = Gtk::Label.new
+  p2_sub.markup = '<small>Select 3 questions and provide your answers. These will be used to reset your password if forgotten.</small>'
+  p2_sub.xalign = 0
+  p2_sub.wrap   = true
+  phase2.pack_start(p2_title, expand: false, fill: false, padding: 0)
+  phase2.pack_start(p2_sub,   expand: false, fill: false, padding: 0)
+  phase2.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
+
+  placeholder_q = '— select a question —'.freeze
+
+  # Build 3 question rows: [ComboBoxText, Entry]
+  sq_rows = 3.times.map do
+    cb = Gtk::ComboBoxText.new
+    cb.append_text(placeholder_q)
+    SECURITY_QUESTION_POOL.each { |q| cb.append_text(q) }
+    cb.active = 0
+    cb.hexpand = true
+
+    ans_e = Gtk::Entry.new
+    ans_e.placeholder_text = 'Your answer'
+    ans_e.hexpand          = true
+
+    row = Gtk::Box.new(:vertical, 4)
+    row.pack_start(cb,    expand: false, fill: false, padding: 0)
+    row.pack_start(ans_e, expand: false, fill: false, padding: 0)
+    phase2.pack_start(row, expand: false, fill: false, padding: 0)
+
+    [cb, ans_e]
+  end
+
+  err2 = Gtk::Label.new
+  err2.xalign = 0
+  phase2.pack_start(err2, expand: false, fill: false, padding: 0)
+
+  area.pack_start(phase2, expand: false, fill: false, padding: 0)
+
+  # ── Dialog buttons ────────────────────────────────────────────────────────
+  d.add_button('Quit', Gtk::ResponseType::CANCEL)
+  ok_btn = d.add_button('Create Vault', Gtk::ResponseType::OK)
+  ok_btn.style_context.add_class('suggested-action')
+  ok_btn.sensitive = false
+  d.default_response = Gtk::ResponseType::OK
+
+  d.show_all
+  phase2.hide
+
+  # Stored credentials from phase 1
+  saved_username = nil
+  saved_password = nil
+
+  # Continue button validates phase 1 and transitions to phase 2
+  continue_btn.signal_connect('clicked') do
+    un = user_e.text.strip
+    pw = pass_e.text
+
+    if un.empty?
+      err1.markup = "<span foreground='red'>⚠ Username is required</span>"
+    elsif pw.empty?
+      err1.markup = "<span foreground='red'>⚠ Password is required</span>"
+    elsif pw.length < 8
+      err1.markup = "<span foreground='red'>⚠ Password must be at least 8 characters</span>"
+    elsif pw != confirm_e.text
+      err1.markup = "<span foreground='red'>⚠ Passwords do not match</span>"
+    else
+      saved_username = un
+      saved_password = pw
+      phase1.hide
+      phase2.show
+      d.resize(520, 1)
+      ok_btn.sensitive = true
+    end
+  end
+
+  loop do
+    resp = d.run
+    unless resp == Gtk::ResponseType::OK
+      d.destroy
+      return nil
+    end
+
+    # Validate phase 2
+    selected_questions = sq_rows.map { |cb, _| cb.active_text }
+    answers            = sq_rows.map { |_, e| e.text.strip }
+
+    if selected_questions.any? { |q| q.nil? || q == placeholder_q }
+      err2.markup = "<span foreground='red'>⚠ Please select a question for each row</span>"
+      next
+    end
+    if selected_questions.uniq.length < selected_questions.length
+      err2.markup = "<span foreground='red'>⚠ Please choose a different question for each row</span>"
+      next
+    end
+    if answers.any?(&:empty?)
+      err2.markup = "<span foreground='red'>⚠ Please answer all security questions</span>"
+      next
+    end
+
+    d.destroy
+    sq_data = selected_questions.zip(answers).map { |q, a| { question: q, answer: a } }
+    return { username: saved_username, password: saved_password, sq_data: sq_data }
+  end
+end
+
+# =============================================================================
+# Master Password / Unlock Dialog
+# Returns: password string on success, :forgot if forgot-password clicked, nil on quit
+# =============================================================================
+def open_master_dialog(username: nil, error_msg: nil)
+  d = Gtk::Dialog.new(title: "Unlock #{APP_TITLE}", parent: nil, flags: [])
+  d.set_default_size(430, -1)
+  d.set_position(:center)
+  d.deletable = false
+
+  area = d.child
+  area.margin = 20
+  area.spacing = 10
+
   top  = Gtk::Box.new(:horizontal, 14)
   icon = Gtk::Image.new(icon_name: 'system-lock-screen', icon_size: :dialog)
   top.pack_start(icon, expand: false, fill: false, padding: 0)
 
   hbox    = Gtk::Box.new(:vertical, 4)
   title_l = Gtk::Label.new
-  title_l.markup = new_vault ?
-    '<b><big>Create Your Vault</big></b>' :
+  title_l.markup = username ?
+    "<b><big>Welcome back, #{esc username}!</big></b>" :
     '<b><big>Unlock Your Vault</big></b>'
   title_l.xalign = 0
 
   sub_l = Gtk::Label.new
-  sub_l.markup = new_vault ?
-    '<small>Choose a strong master password. It cannot be recovered if lost.</small>' :
-    '<small>Enter your master password to access your credentials.</small>'
+  sub_l.markup = '<small>Enter your master password to access your credentials.</small>'
   sub_l.xalign = 0
   sub_l.wrap   = true
 
   hbox.pack_start(title_l, expand: false)
   hbox.pack_start(sub_l,   expand: false)
   top.pack_start(hbox, expand: true, fill: true, padding: 0)
-  area.pack_start(top,                         expand: false, fill: false, padding: 0)
+  area.pack_start(top,                              expand: false, fill: false, padding: 0)
   area.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 0)
 
-  make_row = lambda { |label_text, entry_widget|
+  mk_row = lambda { |label_text, entry_widget|
     row = Gtk::Box.new(:horizontal, 8)
     l = Gtk::Label.new(label_text)
     l.width_chars = 10
@@ -365,60 +590,197 @@ def open_master_dialog(new_vault:, error_msg: nil)
   }
 
   pass_e = Gtk::Entry.new
-  pass_e.visibility       = false
-  pass_e.placeholder_text = 'Master password'
+  pass_e.visibility        = false
+  pass_e.placeholder_text  = 'Master password'
   pass_e.activates_default = true
-  pass_e.hexpand = true
-  area.pack_start(make_row.call('Password:', pass_e), expand: false, fill: false, padding: 0)
-
-  confirm_e = nil
-  if new_vault
-    confirm_e = Gtk::Entry.new
-    confirm_e.visibility        = false
-    confirm_e.placeholder_text  = 'Confirm password'
-    confirm_e.activates_default = true
-    confirm_e.hexpand = true
-    area.pack_start(make_row.call('Confirm:', confirm_e), expand: false, fill: false, padding: 0)
-  end
+  pass_e.hexpand           = true
+  area.pack_start(mk_row.call('Password:', pass_e), expand: false, fill: false, padding: 0)
 
   err_lbl = Gtk::Label.new
   err_lbl.xalign = 0
   err_lbl.markup = "<span foreground='red'>#{esc error_msg}</span>" if error_msg
   area.pack_start(err_lbl, expand: false, fill: false, padding: 0)
 
+  # "Forgot password?" sends a HELP response to avoid nested dialogs
+  forgot_btn = Gtk::Button.new(label: 'Forgot password?')
+  forgot_btn.relief = :none
+  forgot_btn.signal_connect('clicked') { d.response(Gtk::ResponseType::HELP) }
+  area.pack_start(forgot_btn, expand: false, fill: false, padding: 0)
+
   d.add_button('Quit', Gtk::ResponseType::CANCEL)
-  ok_btn = d.add_button(new_vault ? 'Create Vault' : 'Unlock', Gtk::ResponseType::OK)
+  ok_btn = d.add_button('Unlock', Gtk::ResponseType::OK)
   ok_btn.style_context.add_class('suggested-action')
   d.default_response = Gtk::ResponseType::OK
   d.show_all
 
   loop do
     resp = d.run
-    unless resp == Gtk::ResponseType::OK
+    case resp
+    when Gtk::ResponseType::OK
+      pw = pass_e.text
+      if pw.empty?
+        err_lbl.markup = "<span foreground='red'>⚠ Password cannot be empty</span>"
+        next
+      end
+      d.destroy
+      return pw
+    when Gtk::ResponseType::HELP
+      d.destroy
+      return :forgot
+    else
       d.destroy
       return nil
     end
+  end
+end
 
-    pw = pass_e.text
+# =============================================================================
+# Forgot Password Dialog
+# Phase 1: answer security questions  →  Phase 2: set new password
+# All in one dialog, no nested d.run calls.
+# Returns true if password was successfully reset.
+# =============================================================================
+def open_forgot_dialog(vault)
+  questions = vault.security_questions
+  if questions.empty?
+    show_error_dialog(nil, 'No security questions found.',
+      'This vault was created without security questions and cannot be recovered.')
+    return false
+  end
 
-    if pw.empty?
-      err_lbl.markup = "<span foreground='red'>⚠ Password cannot be empty</span>"
+  d = Gtk::Dialog.new(title: 'Reset Master Password', parent: nil, flags: [])
+  d.set_default_size(480, -1)
+  d.set_position(:center)
+  d.deletable = false
+
+  area = d.child
+  area.margin = 20
+  area.spacing = 8
+
+  # ── Phase 1: Security Questions ───────────────────────────────────────────
+  phase1 = Gtk::Box.new(:vertical, 8)
+
+  p1_title = Gtk::Label.new
+  p1_title.markup = '<b><big>Answer Security Questions</big></b>'
+  p1_title.xalign = 0
+  phase1.pack_start(p1_title, expand: false, fill: false, padding: 0)
+
+  ans_entries = questions.map do |q|
+    lbl = Gtk::Label.new(q)
+    lbl.xalign = 0
+    lbl.wrap   = true
+    e = Gtk::Entry.new
+    e.placeholder_text = 'Your answer'
+    e.hexpand          = true
+    phase1.pack_start(lbl, expand: false, fill: false, padding: 0)
+    phase1.pack_start(e,   expand: false, fill: false, padding: 0)
+    e
+  end
+
+  err1 = Gtk::Label.new
+  err1.xalign = 0
+  phase1.pack_start(err1, expand: false, fill: false, padding: 0)
+
+  verify_btn = Gtk::Button.new(label: 'Verify Answers →')
+  verify_btn.style_context.add_class('suggested-action')
+  phase1.pack_start(verify_btn, expand: false, fill: false, padding: 0)
+
+  area.pack_start(phase1, expand: false, fill: false, padding: 0)
+
+  # ── Phase 2: New Password ─────────────────────────────────────────────────
+  phase2 = Gtk::Box.new(:vertical, 8)
+
+  p2_title = Gtk::Label.new
+  p2_title.markup = '<b><big>Set New Master Password</big></b>'
+  p2_title.xalign = 0
+  phase2.pack_start(p2_title, expand: false, fill: false, padding: 0)
+
+  mk_row = lambda { |label_text, entry_widget|
+    row = Gtk::Box.new(:horizontal, 8)
+    l = Gtk::Label.new(label_text)
+    l.width_chars = 10
+    l.xalign      = 1.0
+    row.pack_start(l,            expand: false, fill: false, padding: 0)
+    row.pack_start(entry_widget, expand: true,  fill: true,  padding: 0)
+    row
+  }
+
+  new_pass_e = Gtk::Entry.new
+  new_pass_e.visibility       = false
+  new_pass_e.placeholder_text = 'New master password (min 8 characters)'
+  new_pass_e.hexpand          = true
+  phase2.pack_start(mk_row.call('Password:', new_pass_e), expand: false, fill: false, padding: 0)
+
+  new_confirm_e = Gtk::Entry.new
+  new_confirm_e.visibility       = false
+  new_confirm_e.placeholder_text = 'Confirm new password'
+  new_confirm_e.hexpand          = true
+  phase2.pack_start(mk_row.call('Confirm:', new_confirm_e), expand: false, fill: false, padding: 0)
+
+  err2 = Gtk::Label.new
+  err2.xalign = 0
+  phase2.pack_start(err2, expand: false, fill: false, padding: 0)
+
+  area.pack_start(phase2, expand: false, fill: false, padding: 0)
+
+  # ── Buttons ───────────────────────────────────────────────────────────────
+  d.add_button('Cancel', Gtk::ResponseType::CANCEL)
+  reset_btn = d.add_button('Reset Password', Gtk::ResponseType::OK)
+  reset_btn.sensitive = false
+
+  d.show_all
+  phase2.hide
+
+  verified_answers = nil
+
+  # Verify button fires inside d.run but does NOT open a nested dialog —
+  # it just hides/shows widgets and enables the Reset button.
+  verify_btn.signal_connect('clicked') do
+    answers = ans_entries.map(&:text)
+    if answers.any?(&:empty?)
+      err1.markup = "<span foreground='red'>⚠ Please answer all questions</span>"
+    elsif vault.verify_answers(answers)
+      verified_answers = answers
+      phase1.hide
+      phase2.show
+      d.resize(480, 1)
+      reset_btn.sensitive = true
+      new_pass_e.grab_focus
+    else
+      err1.markup = "<span foreground='red'>⚠ One or more answers are incorrect</span>"
+    end
+  end
+
+  result = false
+  loop do
+    resp = d.run
+    unless resp == Gtk::ResponseType::OK
+      break
+    end
+
+    np = new_pass_e.text
+    if np.empty?
+      err2.markup = "<span foreground='red'>⚠ Password cannot be empty</span>"
       next
     end
-    if new_vault
-      if pw.length < 8
-        err_lbl.markup = "<span foreground='red'>⚠ Minimum 8 characters required</span>"
-        next
-      end
-      if pw != confirm_e.text
-        err_lbl.markup = "<span foreground='red'>⚠ Passwords do not match</span>"
-        next
-      end
+    if np.length < 8
+      err2.markup = "<span foreground='red'>⚠ Minimum 8 characters required</span>"
+      next
     end
-
-    d.destroy
-    return pw
+    if np != new_confirm_e.text
+      err2.markup = "<span foreground='red'>⚠ Passwords do not match</span>"
+      next
+    end
+    if vault.reset_password!(verified_answers, np)
+      result = true
+      break
+    else
+      err2.markup = "<span foreground='red'>⚠ Reset failed – please try again</span>"
+    end
   end
+
+  d.destroy
+  result
 end
 
 # =============================================================================
@@ -437,7 +799,6 @@ def open_entry_dialog(parent, entry = nil)
   area.margin = 16
   area.spacing = 10
 
-  # Grid for labeled fields
   grid = Gtk::Grid.new
   grid.column_spacing = 10
   grid.row_spacing    = 8
@@ -479,25 +840,23 @@ def open_entry_dialog(parent, entry = nil)
     ['Name *',     name_e],
     ['Username *', user_e],
     ['Password *', pass_row],
-    ['URL',        url_e],
+    ['URL',        url_e]
   ]
-
-  rows.each_with_index do |(label_text, widget), i|
-    l = Gtk::Label.new(label_text)
-    l.xalign      = 1.0
-    l.width_chars = 12
-    grid.attach(l,      0, i, 1, 1)
+  rows.each_with_index do |(label, widget), i|
+    lbl = Gtk::Label.new(label)
+    lbl.xalign = 1.0
+    lbl.style_context.add_class('field-label')
+    grid.attach(lbl,    0, i, 1, 1)
     grid.attach(widget, 1, i, 1, 1)
   end
 
   area.pack_start(grid, expand: false, fill: false, padding: 0)
 
-  # Notes text area
   notes_lbl = Gtk::Label.new('Notes')
   notes_lbl.xalign = 0
   area.pack_start(notes_lbl, expand: false, fill: false, padding: 0)
 
-  notes_buf = Gtk::TextBuffer.new
+  notes_buf  = Gtk::TextBuffer.new
   notes_view = Gtk::TextView.new(notes_buf)
   notes_view.wrap_mode = :word_char
   notes_sw = Gtk::ScrolledWindow.new
@@ -511,7 +870,6 @@ def open_entry_dialog(parent, entry = nil)
   err_lbl.xalign = 0
   area.pack_start(err_lbl, expand: false, fill: false, padding: 0)
 
-  # Pre-populate when editing
   if editing
     name_e.text    = entry['name']     || ''
     user_e.text    = entry['username'] || ''
@@ -558,153 +916,128 @@ def open_entry_dialog(parent, entry = nil)
 end
 
 # =============================================================================
-# Detail Panel – builds the right-side credential view
+# Detail Panel – right-side credential view
 # =============================================================================
 def build_detail_panel(entry, on_edit:, on_delete:, on_copy:)
-  outer = Gtk::Box.new(:vertical, 0)
-
-  scroll = Gtk::ScrolledWindow.new
-  scroll.set_policy(:never, :automatic)
-  scroll.hexpand = true
-  scroll.vexpand = true
-
-  content = Gtk::Box.new(:vertical, 0)
-  content.margin = 20
-  content.spacing = 14
+  box = Gtk::Box.new(:vertical, 0)
+  box.margin = 20
 
   # Title row
-  hdr      = Gtk::Box.new(:horizontal, 12)
-  hdr_icon = Gtk::Image.new(icon_name: 'dialog-password', icon_size: :large_toolbar)
-  name_lbl = Gtk::Label.new
-  name_lbl.markup    = "<b><big>#{esc entry['name']}</big></b>"
-  name_lbl.xalign    = 0
-  name_lbl.hexpand   = true
-  name_lbl.ellipsize = :end
-  hdr.pack_start(hdr_icon, expand: false, fill: false, padding: 0)
-  hdr.pack_start(name_lbl, expand: true,  fill: true,  padding: 0)
-  content.pack_start(hdr,                              expand: false, fill: false, padding: 0)
-  content.pack_start(Gtk::Separator.new(:horizontal),  expand: false, fill: false, padding: 0)
+  title_row = Gtk::Box.new(:horizontal, 8)
+  name_lbl  = Gtk::Label.new
+  name_lbl.markup = "<b><big>#{esc entry['name']}</big></b>"
+  name_lbl.xalign = 0
+  name_lbl.hexpand = true
+  title_row.pack_start(name_lbl, expand: true, fill: true, padding: 0)
 
-  # Credential fields
-  [
-    ['USERNAME', entry['username'], false],
-    ['PASSWORD', entry['password'], true],
-    ['URL',      entry['url'],      false],
-  ].each do |field_label, value, secret|
-    next if value.nil? || value.strip.empty?
-
-    fbox = Gtk::Box.new(:vertical, 4)
-
-    lbl = Gtk::Label.new
-    lbl.markup = "<small><b>#{esc field_label}</b></small>"
-    lbl.xalign = 0
-    lbl.style_context.add_class('field-label')
-    fbox.pack_start(lbl, expand: false, fill: false, padding: 0)
-
-    row = Gtk::Box.new(:horizontal, 4)
-
-    if secret
-      val_e          = Gtk::Entry.new
-      val_e.text     = value
-      val_e.visibility = false
-      val_e.editable = false
-      val_e.hexpand  = true
-      val_e.style_context.add_class('monospace')
-
-      show_btn = Gtk::ToggleButton.new
-      show_btn.image        = Gtk::Image.new(icon_name: 'view-reveal-symbolic', icon_size: :button)
-      show_btn.tooltip_text = 'Show / Hide'
-      show_btn.signal_connect('toggled') { |b| val_e.visibility = b.active? }
-
-      copy_btn = Gtk::Button.new
-      copy_btn.image        = Gtk::Image.new(icon_name: 'edit-copy-symbolic', icon_size: :button)
-      copy_btn.tooltip_text = "Copy #{field_label.capitalize}"
-      copy_btn.signal_connect('clicked') { on_copy.call(value, field_label.capitalize) }
-
-      row.pack_start(val_e,     expand: true,  fill: true,  padding: 0)
-      row.pack_start(show_btn,  expand: false, fill: false, padding: 0)
-      row.pack_start(copy_btn,  expand: false, fill: false, padding: 0)
-    else
-      val_lbl           = Gtk::Label.new(value)
-      val_lbl.xalign    = 0
-      val_lbl.selectable = true
-      val_lbl.ellipsize = :end
-      val_lbl.hexpand   = true
-
-      copy_btn = Gtk::Button.new
-      copy_btn.image        = Gtk::Image.new(icon_name: 'edit-copy-symbolic', icon_size: :button)
-      copy_btn.tooltip_text = "Copy #{field_label.capitalize}"
-      copy_btn.signal_connect('clicked') { on_copy.call(value, field_label.capitalize) }
-
-      row.pack_start(val_lbl,  expand: true,  fill: true,  padding: 0)
-      row.pack_start(copy_btn, expand: false, fill: false, padding: 0)
-    end
-
-    fbox.pack_start(row, expand: false, fill: false, padding: 0)
-    content.pack_start(fbox, expand: false, fill: false, padding: 0)
-  end
-
-  # Notes
-  unless entry['notes'].to_s.strip.empty?
-    nbox = Gtk::Box.new(:vertical, 4)
-    n_lbl = Gtk::Label.new
-    n_lbl.markup = '<small><b>NOTES</b></small>'
-    n_lbl.xalign = 0
-    n_lbl.style_context.add_class('field-label')
-    n_text = Gtk::Label.new(entry['notes'])
-    n_text.xalign     = 0
-    n_text.wrap       = true
-    n_text.selectable = true
-    nbox.pack_start(n_lbl,  expand: false)
-    nbox.pack_start(n_text, expand: false)
-    content.pack_start(nbox, expand: false, fill: false, padding: 0)
-  end
-
-  # Timestamp
-  ts_lbl = Gtk::Label.new
-  ts_lbl.markup = "<small><span foreground='gray'>Updated: #{esc entry['updated_at']}</span></small>"
-  ts_lbl.xalign = 0
-  content.pack_start(ts_lbl, expand: false, fill: false, padding: 0)
-
-  scroll.add(content)
-  outer.pack_start(scroll, expand: true, fill: true, padding: 0)
-
-  # Action buttons
-  btn_bar = Gtk::Box.new(:horizontal, 8)
-  btn_bar.halign        = :center
-  btn_bar.margin_top    = 4
-  btn_bar.margin_bottom = 12
-
-  edit_btn = Gtk::Button.new(label: ' Edit')
-  edit_btn.image           = Gtk::Image.new(icon_name: 'document-edit-symbolic', icon_size: :button)
-  edit_btn.always_show_image = true
+  edit_btn = Gtk::Button.new
+  edit_btn.image        = Gtk::Image.new(icon_name: 'document-edit-symbolic', icon_size: :button)
+  edit_btn.tooltip_text = 'Edit'
+  edit_btn.relief       = :none
   edit_btn.signal_connect('clicked') { on_edit.call }
 
-  del_btn = Gtk::Button.new(label: ' Delete')
-  del_btn.image           = Gtk::Image.new(icon_name: 'user-trash-symbolic', icon_size: :button)
-  del_btn.always_show_image = true
-  del_btn.style_context.add_class('destructive-action')
+  del_btn = Gtk::Button.new
+  del_btn.image        = Gtk::Image.new(icon_name: 'user-trash-symbolic', icon_size: :button)
+  del_btn.tooltip_text = 'Delete'
+  del_btn.relief       = :none
   del_btn.signal_connect('clicked') { on_delete.call }
 
-  btn_bar.pack_start(edit_btn, expand: false)
-  btn_bar.pack_start(del_btn,  expand: false)
-  outer.pack_start(btn_bar, expand: false, fill: false, padding: 0)
+  title_row.pack_start(edit_btn, expand: false, fill: false, padding: 0)
+  title_row.pack_start(del_btn,  expand: false, fill: false, padding: 0)
+  box.pack_start(title_row, expand: false, fill: false, padding: 0)
+  box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 8)
 
-  outer
+  mk_field = lambda { |label, value, copyable: true|
+    row = Gtk::Box.new(:vertical, 2)
+    lbl = Gtk::Label.new(label.upcase)
+    lbl.xalign = 0
+    lbl.style_context.add_class('field-label')
+    row.pack_start(lbl, expand: false)
+
+    inner = Gtk::Box.new(:horizontal, 4)
+    val_lbl = Gtk::Label.new(value.to_s)
+    val_lbl.xalign      = 0
+    val_lbl.selectable  = true
+    val_lbl.wrap        = true
+    val_lbl.hexpand     = true
+    inner.pack_start(val_lbl, expand: true, fill: true, padding: 0)
+
+    if copyable && !value.to_s.empty?
+      copy_btn = Gtk::Button.new
+      copy_btn.image        = Gtk::Image.new(icon_name: 'edit-copy-symbolic', icon_size: :button)
+      copy_btn.tooltip_text = "Copy #{label}"
+      copy_btn.relief       = :none
+      copy_btn.signal_connect('clicked') { on_copy.call(value, label) }
+      inner.pack_start(copy_btn, expand: false, fill: false, padding: 0)
+    end
+
+    row.pack_start(inner, expand: false)
+    box.pack_start(row, expand: false, fill: false, padding: 0)
+    box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
+  }
+
+  mk_field.call('Username', entry['username'])
+  mk_field.call('URL',      entry['url'])
+
+  # Password field with show/hide toggle
+  pw_row  = Gtk::Box.new(:vertical, 2)
+  pw_lbl  = Gtk::Label.new('PASSWORD')
+  pw_lbl.xalign = 0
+  pw_lbl.style_context.add_class('field-label')
+  pw_row.pack_start(pw_lbl, expand: false)
+
+  pw_inner = Gtk::Box.new(:horizontal, 4)
+  pw_val   = Gtk::Label.new('••••••••••••')
+  pw_val.xalign   = 0
+  pw_val.hexpand  = true
+  pw_inner.pack_start(pw_val, expand: true, fill: true, padding: 0)
+
+  show_btn = Gtk::ToggleButton.new
+  show_btn.image        = Gtk::Image.new(icon_name: 'view-reveal-symbolic', icon_size: :button)
+  show_btn.tooltip_text = 'Show / Hide password'
+  show_btn.relief       = :none
+  show_btn.signal_connect('toggled') do |b|
+    pw_val.text = b.active? ? entry['password'].to_s : '••••••••••••'
+  end
+
+  copy_btn = Gtk::Button.new
+  copy_btn.image        = Gtk::Image.new(icon_name: 'edit-copy-symbolic', icon_size: :button)
+  copy_btn.tooltip_text = 'Copy Password'
+  copy_btn.relief       = :none
+  copy_btn.signal_connect('clicked') { on_copy.call(entry['password'], 'Password') }
+
+  pw_inner.pack_start(show_btn, expand: false, fill: false, padding: 0)
+  pw_inner.pack_start(copy_btn, expand: false, fill: false, padding: 0)
+  pw_row.pack_start(pw_inner, expand: false)
+  box.pack_start(pw_row,                      expand: false, fill: false, padding: 0)
+  box.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 4)
+
+  unless entry['notes'].to_s.empty?
+    mk_field.call('Notes', entry['notes'], copyable: false)
+  end
+
+  ts = entry['updated_at'] || entry['created_at']
+  if ts
+    ts_lbl = Gtk::Label.new("Last updated: #{ts}")
+    ts_lbl.xalign = 0
+    ts_lbl.style_context.add_class('field-label')
+    box.pack_start(ts_lbl, expand: false, fill: false, padding: 0)
+  end
+
+  box.show_all
+  box
 end
 
 def build_empty_detail
-  box = Gtk::Box.new(:vertical, 14)
-  box.valign  = :center
-  box.halign  = :center
-  box.vexpand = true
+  box = Gtk::Box.new(:vertical, 12)
+  box.valign = :center
   box.hexpand = true
+  box.vexpand = true
 
   img = Gtk::Image.new(icon_name: 'system-lock-screen', icon_size: :dialog)
   lbl = Gtk::Label.new
-  lbl.markup  = "<span foreground='gray'>Select a credential to view its details\nor click <b>＋</b> to add a new one.</span>"
-  lbl.justify = :center
-  lbl.wrap    = true
+  lbl.markup = '<span alpha="40%">Select an entry to view its details</span>'
+  lbl.style_context.add_class('empty-hint')
 
   box.pack_start(img, expand: false)
   box.pack_start(lbl, expand: false)
@@ -728,7 +1061,6 @@ class App
     Gtk.main
   end
 
-  # ── Private ────────────────────────────────────────────────────────────────
   private
 
   def apply_css
@@ -747,11 +1079,10 @@ class App
     @win.set_position(:center)
     @win.signal_connect('delete-event') { Gtk.main_quit; false }
 
-    # ── Header bar ─────────────────────────────────────────────────────────
     hbar = Gtk::HeaderBar.new
-    hbar.title               = APP_TITLE
-    hbar.subtitle            = 'Password Manager'
-    hbar.show_close_button   = true
+    hbar.title             = APP_TITLE
+    hbar.subtitle          = 'Password Manager'
+    hbar.show_close_button = true
     @win.set_titlebar(hbar)
 
     @add_btn = Gtk::Button.new
@@ -769,10 +1100,8 @@ class App
     @count_lbl = Gtk::Label.new('0 entries')
     hbar.pack_end(@count_lbl)
 
-    # ── Root layout ────────────────────────────────────────────────────────
     root = Gtk::Box.new(:vertical, 0)
 
-    # Search bar
     sbar = Gtk::Box.new(:horizontal, 8)
     sbar.margin = 8
     @search_e = Gtk::SearchEntry.new
@@ -783,8 +1112,7 @@ class App
     root.pack_start(sbar, expand: false, fill: false, padding: 0)
     root.pack_start(Gtk::Separator.new(:horizontal), expand: false, fill: false, padding: 0)
 
-    # Paned: list | detail
-    @paned = Gtk::Paned.new(:horizontal)
+    @paned          = Gtk::Paned.new(:horizontal)
     @paned.position = 268
     @paned.vexpand  = true
     @paned.pack1(build_list_panel, resize: false, shrink: false)
@@ -798,14 +1126,12 @@ class App
 
     root.pack_start(@paned, expand: true, fill: true, padding: 0)
 
-    # Status bar
     @statusbar = Gtk::Statusbar.new
     @sb_ctx    = @statusbar.get_context_id('app')
     root.pack_start(@statusbar, expand: false, fill: false, padding: 0)
 
     @win.add(root)
 
-    # Keyboard shortcuts
     @win.signal_connect('key-press-event') do |_, ev|
       if ev.state.control_mask?
         case ev.keyval
@@ -825,11 +1151,10 @@ class App
     sw.set_policy(:never, :automatic)
     sw.vexpand = true
 
-    # ListStore: id | name | username
     @store = Gtk::ListStore.new(String, String, String)
 
     @tree = Gtk::TreeView.new(@store)
-    @tree.headers_visible       = false
+    @tree.headers_visible         = false
     @tree.activate_on_single_click = false
 
     col    = Gtk::TreeViewColumn.new
@@ -862,7 +1187,6 @@ class App
     left
   end
 
-  # Replaces the content of the detail scroll window
   def swap_detail(widget)
     @detail_sw.children.each { |c| @detail_sw.remove(c) }
     @detail_sw.add(widget)
@@ -899,8 +1223,6 @@ class App
     n = entries.size
     @count_lbl.text = "#{n} #{n == 1 ? 'entry' : 'entries'}"
   end
-
-  # ── Actions ────────────────────────────────────────────────────────────────
 
   def do_search(q)
     @search_query = q
@@ -949,32 +1271,52 @@ class App
     show_auth_screen
   end
 
-  # ── Auth flow ──────────────────────────────────────────────────────────────
-
   def show_auth_screen
     loop do
-      pw = open_master_dialog(new_vault: !@vault.exists?)
-      unless pw
-        Gtk.main_quit
-        return
-      end
-
       if @vault.exists?
-        if @vault.unlock(pw)
-          break
+        # Read stored username for the welcome message
+        username = begin
+          JSON.parse(File.read(META_FILE, encoding: 'UTF-8'))['username']
+        rescue StandardError
+          nil
+        end
+
+        result = open_master_dialog(username: username)
+
+        case result
+        when nil
+          Gtk.main_quit
+          return
+        when :forgot
+          if open_forgot_dialog(@vault)
+            # Password was reset; loop back to unlock dialog
+          end
+          next
         else
-          show_error_dialog(nil, 'Incorrect master password', 'Please try again.')
+          if @vault.unlock(result)
+            break
+          else
+            show_error_dialog(nil, 'Incorrect master password', 'Please try again.')
+          end
         end
       else
-        @vault.create!(pw)
+        # First run — collect username, password, security questions
+        setup_data = open_setup_dialog
+        unless setup_data
+          Gtk.main_quit
+          return
+        end
+        @vault.create!(**setup_data)
         break
       end
     end
 
     @win.show_all
     refresh_list
-    status_flash(@statusbar, @sb_ctx,
-      @vault.entries.empty? ? 'Vault ready – click ＋ to add your first credential' : 'Vault unlocked')
+    msg = @vault.entries.empty? ?
+      'Vault ready – click ＋ to add your first credential' :
+      "Welcome back, #{@vault.username}!"
+    status_flash(@statusbar, @sb_ctx, msg)
   end
 end
 
