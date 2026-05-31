@@ -25,6 +25,7 @@ VAULT_DIR         = File.join(Dir.home, '.securevault')
 VAULT_FILE        = File.join(VAULT_DIR, 'vault.dat')
 META_FILE         = File.join(VAULT_DIR, 'vault.meta')
 REMEMBER_FILE     = File.join(VAULT_DIR, 'remember')
+THEME_FILE        = File.join(VAULT_DIR, 'theme')
 APP_TITLE         = 'SecureVault'
 
 # Fixed set of security questions (user answers first 3)
@@ -345,6 +346,17 @@ end
 def status_flash(statusbar, ctx_id, msg, seconds: 4)
   statusbar.push(ctx_id, msg)
   GLib::Timeout.add(seconds * 1000) { statusbar.pop(ctx_id); false }
+end
+
+def load_theme_preference
+  File.read(THEME_FILE, encoding: 'UTF-8').strip == 'light' ? :light : :dark
+rescue StandardError
+  :dark
+end
+
+def save_theme_preference(mode)
+  File.write(THEME_FILE, mode.to_s, encoding: 'UTF-8')
+rescue StandardError
 end
 
 def remembered_username
@@ -1097,12 +1109,13 @@ end
 # =============================================================================
 class App
   def initialize
-    @vault        = Vault.new
-    @selected_id  = nil
-    @search_query = ''
+    @vault         = Vault.new
+    @selected_id   = nil
+    @search_query  = ''
+    @current_theme = load_theme_preference
     apply_css
     build_window
-    # Schedule auth after Gtk.main starts so Gtk.main_quit works correctly
+    apply_theme(@current_theme)
     GLib::Idle.add { show_auth_screen; false }
   end
 
@@ -1111,6 +1124,21 @@ class App
   end
 
   private
+
+  def apply_theme(mode)
+    @current_theme = mode
+    dark = (mode == :dark)
+    Gtk::Settings.default.gtk_application_prefer_dark_theme = dark
+    if @theme_btn
+      @theme_btn.label        = dark ? '☀' : '🌙'
+      @theme_btn.tooltip_text = dark ? 'Switch to light mode' : 'Switch to dark mode'
+    end
+    save_theme_preference(mode)
+  end
+
+  def toggle_theme
+    apply_theme(@current_theme == :dark ? :light : :dark)
+  end
 
   def apply_css
     prov = Gtk::CssProvider.new
@@ -1145,6 +1173,11 @@ class App
     lock_btn.tooltip_text = 'Lock vault  (Ctrl+L)'
     lock_btn.signal_connect('clicked') { do_lock }
     @hbar.pack_end(lock_btn)
+
+    @theme_btn = Gtk::Button.new(label: '🌙')
+    @theme_btn.tooltip_text = 'Switch to light mode'
+    @theme_btn.signal_connect('clicked') { toggle_theme }
+    @hbar.pack_end(@theme_btn)
 
     @count_lbl = Gtk::Label.new('0 entries')
     @hbar.pack_end(@count_lbl)
